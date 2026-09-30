@@ -259,15 +259,17 @@ then the same commands as on the Mac with your card's name from `ip -br link`, f
 | **1-4 Record data 20 s** | Camera frames (5 per second) and robot state, saved in `data/cable_run_<time>/` or `data/wifi_run_<time>/`. | no |
 | **2-1 Stand up** | StandUp: the dog stands and holds still. | **yes** |
 | **2-2 Balance stand** | BalanceStand: ready to walk. Do it before walking. | **yes** |
-| **2-3 Walk forward** | 0.2 m/s for 2 s (about 40 cm), then StopMove. | **yes** |
-| **2-4 Turn left** | 0.3 rad/s for 2 s (about 35 degrees), then StopMove. | **yes** |
+| **2-3 Walk forward** | 0.3 m/s for 3 s, then StopMove. Prints how far the dog measured it moved (up to about 0.9 m). | **yes** |
+| **2-4 Turn left** | 0.5 rad/s for 3 s, then StopMove. Prints how many degrees the dog measured (up to about 85). | **yes** |
 | **2-5 Lie down** | StandDown. The safe way to finish. | **yes** |
 | **■ STOP** (top right, and in box 2) | Ends any motion command still running, then StopMove. Always allowed, no dialog. | stops it |
 | **Damp** | All motors go soft. **A standing dog drops**: only after Lie down. | **yes** |
 | **Close programs opened by this panel** | Ends scripts the panel started. It does not stop the dog: use STOP for that. | no |
 
 The **2-x** buttons and **Damp** stay grey until you tick **Allow motion**, and each one asks for confirmation (the
-default answer is No). A recording has these columns in `state.csv`: time, 12 joint angles, 12 joint speeds,
+default answer is No). Before walking or turning, the panel reads the dog's mode: if it is standing but not in
+balance stand (for example right after 2-1), it sends BalanceStand first, because Move does little otherwise; if the
+dog is lying down, it refuses. Everything the dark box shows is also saved in `data/logs/panel_<date>.log`. A recording has these columns in `state.csv`: time, 12 joint angles, 12 joint speeds,
 4 foot forces, roll, pitch, yaw, 3 gyroscope values, battery voltage, body velocity (3) and body position (3), plus
 one JPEG per frame listed in `frames.csv`.
 
@@ -293,6 +295,8 @@ one JPEG per frame listed in `frames.csv`.
 | `needs the dog's AES key` / `rejected the AES key` / `does not look like a key` | See [Wi-Fi key](#wi-fi-key-firmware-1115-or-newer). |
 | `Wait for the running Wi-Fi command to finish` | The dog takes one Wi-Fi command at a time: wait for `done`. |
 | `sport mode is RELEASED` | The dog is in low-level mode. Ask your instructor, or restart the dog. |
+| The dog only moves a little when walking or turning | Do 2-2 Balance stand first (2-3 and 2-4 now do it for you). The dog speeds up gradually, so it covers less than speed x time; the output line `measured by the dog: moved ... m, turned ... degrees` shows how much it really moved. |
+| `the dog is lying down ... Nothing sent` | Click 2-1 Stand up and 2-2 Balance stand, then walk. |
 | Return code `3102` (cable) | The dog's sport service was not found: wrong network card, dog still starting, or not an EDU. |
 | `no such file or directory` in Terminal | You are not in the panel's folder: `cd go2-control-panel` first. |
 | `Python 3.10 is needed`, or the window does not open | Install Python 3.10 (above) and run `bash setup.sh` again. |
@@ -321,8 +325,11 @@ bash robot/wifi_check.sh                                    # 1-1 on Wi-Fi
 - The addresses, topics and command numbers are in
   [How the computer talks to the dog](#how-the-computer-talks-to-the-dog-any-computer). Only high-level commands are
   sent; the dog's own controller decides how to move its 12 motors.
-- A walk re-sends Move 20 times a second and always ends with StopMove. STOP, the panel's time limits and closing the
-  window all end a running walk the same way, and a command that has not gone out yet is not sent after STOP.
+- A walk first checks the dog's sport mode (`rt/sportmodestate`: 1 balance stand and 3 walking can walk; 0, 2, 6
+  and 8 are standing, so BalanceStand is sent first; 5, 7 and 10 are lying, soft or sitting, so it refuses). It then
+  re-sends Move 20 times a second and always ends with StopMove, and prints the distance and turn from the dog's own
+  position estimate. STOP, the panel's time limits and closing the window all end a running walk the same way, and a
+  command that has not gone out yet is not sent after STOP.
 
 The panel has been tested on macOS only; for Windows and Linux see
 [above](#windows-and-linux-command-line-not-tested-yet).

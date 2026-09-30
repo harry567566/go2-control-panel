@@ -18,6 +18,7 @@ move limits (clamped here): |vx| <= 0.3 m/s, |vy| <= 0.2 m/s, |vyaw| <= 0.5 rad/
 """
 import asyncio
 import json
+import math
 import random
 import sys
 import time
@@ -28,6 +29,12 @@ SPORT_TOPIC = "rt/api/sport/request"
 SWITCHER_TOPIC = "rt/api/motion_switcher/request"
 LIMITS = {"vx": 0.3, "vy": 0.2, "vyaw": 0.5, "seconds": 3.0}
 MOVE_PERIOD = 0.05  # re-send the Move command every 0.05 s (20 times per second)
+
+# the dog's sport mode (rt/lf/sportmodestate "mode") decides whether Move can make it walk
+MODE_NAMES = {0: "idle stand", 1: "balance stand", 2: "pose", 3: "walking", 5: "lying down", 6: "joints locked",
+              7: "damping", 8: "recovery stand", 10: "sitting"}
+STANDING_LOCKED = (0, 2, 6, 8)  # standing, but Move does little there until BalanceStand
+DOWN = (5, 7, 10)               # lying, soft or sitting: stand it up first
 
 # action -> (name, api id, what it does, asks for Enter first?)
 ACTIONS = {
@@ -118,6 +125,20 @@ async def check_mode(conn):
     return True
 
 
+def pose(state):
+    """(x, y, heading) from the latest rt/lf/sportmodestate message, or None."""
+    msg = state.get("msg") or {}
+    pos, rpy = msg.get("position"), (msg.get("imu_state") or {}).get("rpy")
+    return (float(pos[0]), float(pos[1]), float(rpy[2])) if pos and rpy else None
+
+
+def moved(start, end):
+    """How far and how much it turned between two poses, as the dog measured it."""
+    dist = math.hypot(end[0] - start[0], end[1] - start[1])
+    turn = math.degrees(math.atan2(math.sin(end[2] - start[2]), math.cos(end[2] - start[2])))
+    return f"measured by the dog: moved {dist:.2f} m, turned {turn:+.0f} degrees"
+
+
 async def main():
     target, action, move, dry_run, yes = parse_args(sys.argv[1:])
     method, api_id, what, confirm = ACTIONS[action]
@@ -147,6 +168,25 @@ async def main():
                 code = await request(conn, SPORT_TOPIC, api_id)  # safe to repeat: try once more
             print(f"{method} returned {'0 (OK)' if code == 0 else '-1 (no answer)' if code == -1 else code}")
             return
+        # make sure the dog can walk, keep sending the velocity, always stop, then say how far it went
+        state = {}
+        conn.datachannel.pub_sub.subscribe("rt/lf/sportmodestate", lambda m: state.update(msg=m.get("data", {})))
+        t_wait = time.time() + 1.5
+        while "msg" not in state and time.time() < t_wait:
+            await asyncio.sleep(0.05)
+        mode = state.get("msg", {}).get("mode")
+        name = MODE_NAMES.get(mode, "unknown")
+        if mode in DOWN:
+            print(f"the dog is {name} (mode {mode}): click Stand up, then Balance stand, then walk. Nothing sent.")
+            sys.exit(4)
+        if mode in STANDING_LOCKED and not STOP["requested"]:
+            print(f"the dog is in '{name}' (mode {mode}), where Move does little: sending BalanceStand first")
+            code = await request(conn, SPORT_TOPIC, 1002)
+            print(f"BalanceStand returned {'0 (OK)' if code == 0 else '-1 (no answer)' if code == -1 else code}")
+            await asyncio.sleep(1.5)
+        elif mode is None:
+            print("no sport state from the dog yet (mode unknown): walking anyway")
+        start = pose(state)
         n_sent, t_end = 0, None
         try:
             while not STOP["requested"] and (t_end is None or time.time() < t_end):
@@ -166,6 +206,10 @@ async def main():
                 code = await request(conn, SPORT_TOPIC, 1003)
             print(f"Move sent {n_sent} times")
             print(f"StopMove returned {'0 (OK)' if code == 0 else '-1 (no answer)' if code == -1 else code}")
+        await asyncio.sleep(1.0)  # let the dog settle, then read where it thinks it is
+        end = pose(state)
+        if start and end:
+            print(moved(start, end))
     finally:
         await disconnect(conn)
 

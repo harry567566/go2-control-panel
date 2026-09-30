@@ -138,17 +138,24 @@ SECTIONS = [
            "The dog stands and makes small balancing movements.", "Do this after Stand up and before walking."),
           ("2-2  平衡站立", "BalanceStand:站着保持平衡,准备走路。", "狗站着,会轻微调整。", "站起来之后、走路之前做这一步。"),
           motion=True),
-        A("m_walk", ("sport.py", "move", "0.2", "0", "0", "2", "--yes"),
-          ("2-3  Walk forward 0.2 m/s, 2 s", "Move(0.2, 0, 0), re-sent 20 times a second for 2 seconds, then "
-           "StopMove.", "The dog walks about 40 cm forward and stops.",
+        A("m_walk", ("sport.py", "move", "0.3", "0", "0", "3", "--yes"),
+          ("2-3  Walk forward 0.3 m/s, 3 s", "Move(0.3, 0, 0), re-sent 20 times a second for 3 seconds, then "
+           "StopMove. If the dog is standing but not in balance stand (for example right after Stand up), it sends "
+           "BalanceStand first; if the dog is lying down, it refuses.",
+           "The dog walks forward and stops. The output then says how far the dog measured it moved (up to about "
+           "0.9 m; less, because the dog speeds up gradually).",
            "Speed and time are limited in the script: at most 0.3 m/s and 3 s."),
-          ("2-3  往前走 2 秒(0.2 米/秒)", "Move(0.2, 0, 0),每秒重发 20 次,持续 2 秒,然后 StopMove。",
-           "狗往前走大约 40 厘米然后停。", "脚本里限制了速度和时间:最多 0.3 米/秒、3 秒。"), motion=True),
-        A("m_turn", ("sport.py", "move", "0", "0", "0.3", "2", "--yes"),
-          ("2-4  Turn left slowly, 2 s", "Move(0, 0, 0.3) for 2 seconds, then StopMove.",
-           "The dog turns left on the spot, about 35 degrees.", ""),
-          ("2-4  原地慢慢左转 2 秒", "Move(0, 0, 0.3) 持续 2 秒,然后 StopMove。", "狗原地左转大约 35 度。", ""),
-          motion=True),
+          ("2-3  往前走 3 秒(0.3 米/秒)", "Move(0.3, 0, 0),每秒重发 20 次,持续 3 秒,然后 StopMove。狗站着但不在"
+           "平衡站立(比如刚站起来)时,会先自动发 BalanceStand;狗趴着时不执行。",
+           "狗往前走然后停。输出里会写狗自己测量走了多远(最多约 0.9 米;狗是慢慢加速的,所以会少一些)。",
+           "脚本里限制了速度和时间:最多 0.3 米/秒、3 秒。"), motion=True, limit=30),
+        A("m_turn", ("sport.py", "move", "0", "0", "0.5", "3", "--yes"),
+          ("2-4  Turn left 0.5 rad/s, 3 s", "Move(0, 0, 0.5) for 3 seconds, then StopMove (BalanceStand first if "
+           "needed, like 2-3).", "The dog turns left on the spot. The output says how many degrees it measured "
+           "(up to about 85).", "Speed and time are limited in the script: at most 0.5 rad/s and 3 s."),
+          ("2-4  原地左转 3 秒(0.5 弧度/秒)", "Move(0, 0, 0.5) 持续 3 秒,然后 StopMove(需要时先发 BalanceStand,"
+           "和 2-3 一样)。", "狗原地左转。输出里会写狗测量转了多少度(最多约 85 度)。",
+           "脚本里限制了速度和时间:最多 0.5 弧度/秒、3 秒。"), motion=True, limit=30),
         A("m_standdown", ("sport.py", "standdown", "--yes"),
           ("2-5  Lie down", "StandDown: the dog lowers its body to the ground.", "The dog lies down.",
            "The safe way to finish. Do this before Damp."),
@@ -425,8 +432,9 @@ INTRO = [  # (text style, English, Chinese) for the start page
      "关掉手机上的 Unitree App,在屏幕右上角的 Wi-Fi 菜单里连上狗的 Wi-Fi。选 Wi-Fi,点 1-1,再点 1-2。"
      "一次只点一个按钮。\n"),
     ("k", "Moving the dog, only with the instructor:  ", "让狗动(只在老师在场时):"),
-    (None, "tick 'Allow motion', then 2-1 Stand up -> 2-2 Balance stand -> 2-3 Walk -> 2-5 Lie down.\n",
-     "勾选 '允许运动',再按 2-1 站起来 → 2-2 平衡站立 → 2-3 走 → 2-5 趴下。\n"),
+    (None, "tick 'Allow motion', then 2-1 Stand up -> 2-2 Balance stand -> 2-3 Walk -> 2-5 Lie down. "
+           "Everything in the dark box is also saved in data/logs/.\n",
+     "勾选 '允许运动',再按 2-1 站起来 → 2-2 平衡站立 → 2-3 走 → 2-5 趴下。黑框里的内容也会存到 data/logs/。\n"),
     ("warn", "The red STOP (top right) is always there. Emergency: L2 + B on the remote makes all motors go soft.",
      "右上角红色的「停止」随时能按。紧急情况:遥控器上按 L2 + B,所有电机会变软。"),
 ]
@@ -443,6 +451,7 @@ class Panel:
         self.current = None
         self.status = ("?", "")
         self.closing = False
+        self.logfile = os.path.join(DATA, "logs", time.strftime("panel_%Y%m%d.log"))  # a copy of the dark box
         try:  # always draw this window in light mode, whatever the system setting
             root.tk.call("::tk::unsupported::MacWindowStyle", "appearance", root, "aqua")
         except tk.TclError:
@@ -643,6 +652,12 @@ class Panel:
     def write(self, line, tag=None):
         self.log.insert("end", line + "\n", tag)
         self.log.see("end")
+        try:
+            os.makedirs(os.path.dirname(self.logfile), exist_ok=True)
+            with open(self.logfile, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%H:%M:%S ") + line + "\n")
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ running
     def run(self, a):

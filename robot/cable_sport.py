@@ -15,11 +15,15 @@ Add --dry-run to only print what would be sent (no network, no robot needed).
 Add --yes to skip the 'Press Enter' question (the control panel asks in a dialog instead).
 
 Suggested first session:  standup -> balance -> move (small) -> stop -> standdown -> damp
+move reads the dog's sport mode first: standing but not balanced (for example right after standup) -> it sends
+BalanceStand first, because Move does little otherwise; lying down -> it refuses. At the end it prints how far
+the dog moved and turned, from the dog's own estimate (rt/sportmodestate).
 Damp while STANDING makes the robot sink to the floor, so lie it down first.
 
 move limits (clamped here): |vx| <= 0.3 m/s forward, |vy| <= 0.2 m/s left,
 |vyaw| <= 0.5 rad/s turn left, seconds <= 3. StopMove is always sent at the end.
 """
+import math
 import signal
 import sys
 import time
@@ -45,6 +49,12 @@ DOMAIN_ID = 0  # the real robot always uses DDS domain 0
 
 LIMITS = {"vx": 0.3, "vy": 0.2, "vyaw": 0.5, "seconds": 3.0}
 MOVE_PERIOD = 0.05  # re-send the Move command every 0.05 s (20 times per second)
+
+# the dog's sport mode (rt/sportmodestate.mode) decides whether Move can make it walk
+MODE_NAMES = {0: "idle stand", 1: "balance stand", 2: "pose", 3: "walking", 5: "lying down", 6: "joints locked",
+              7: "damping", 8: "recovery stand", 10: "sitting"}
+STANDING_LOCKED = (0, 2, 6, 8)  # standing, but Move does little there until BalanceStand
+DOWN = (5, 7, 10)               # lying, soft or sitting: stand it up first
 
 # action -> (SportClient method name, API id, what it does, asks for Enter first?)
 ACTIONS = {
@@ -136,6 +146,38 @@ def check_mode():
     return True
 
 
+class Odometry:
+    """The dog's own estimate of its mode, position and heading (rt/sportmodestate), read around a walk."""
+
+    def __init__(self):
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+        self.msg = None
+        self.sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+        self.sub.Init(self._on_state, 10)
+
+    def _on_state(self, msg):
+        self.msg = msg
+
+    def mode(self, wait=1.0):
+        t_end = time.time() + wait
+        while self.msg is None and time.time() < t_end:
+            time.sleep(0.05)
+        return None if self.msg is None else int(self.msg.mode)
+
+    def pose(self):
+        """(x, y, heading) in metres and radians, or None."""
+        m = self.msg
+        return None if m is None else (float(m.position[0]), float(m.position[1]), float(m.imu_state.rpy[2]))
+
+
+def moved(start, end):
+    """How far and how much it turned between two poses, as the dog measured it."""
+    dist = math.hypot(end[0] - start[0], end[1] - start[1])
+    turn = math.degrees(math.atan2(math.sin(end[2] - start[2]), math.cos(end[2] - start[2])))
+    return f"measured by the dog: moved {dist:.2f} m, turned {turn:+.0f} degrees"
+
+
 def main():
     iface, action, move, dry_run, yes = parse_args(sys.argv[1:])
     method, api_id, what, confirm = ACTIONS[action]
@@ -183,8 +225,21 @@ def main():
         print(f"{method} returned {explain(code)}")
         return
 
-    # move: keep sending the velocity, then always stop.
+    # move: make sure the dog can walk, keep sending the velocity, always stop, then say how far it went.
     vx, vy, vyaw, secs = move
+    odo = Odometry()
+    mode = odo.mode()
+    name = MODE_NAMES.get(mode, "unknown")
+    if mode in DOWN:
+        print(f"the dog is {name} (mode {mode}): click Stand up, then Balance stand, then walk. Nothing sent.")
+        sys.exit(4)
+    if mode in STANDING_LOCKED and not STOP_REQUESTED:
+        print(f"the dog is in '{name}' (mode {mode}), where Move does little: sending BalanceStand first")
+        print(f"BalanceStand returned {explain(client.BalanceStand())}")
+        time.sleep(1.5)
+    elif mode is None:
+        print("no sport state from the dog yet (mode unknown): walking anyway")
+    start = odo.pose()
     first_code, n_sent = None, 0
     t_end = None
     try:
@@ -206,6 +261,13 @@ def main():
         first = explain(first_code) if first_code is not None else "none sent"
         print(f"Move sent {n_sent} times, first return {first}")
         print(f"StopMove returned {explain(code)}")
+    try:
+        time.sleep(1.0)  # let the dog settle, then read where it thinks it is
+    except KeyboardInterrupt:  # STOP after the walk: StopMove has gone out already, so just measure
+        pass
+    end = odo.pose()
+    if start and end:
+        print(moved(start, end))
 
 
 if __name__ == "__main__":
