@@ -1,0 +1,174 @@
+"""Send ONE high-level sport command to a REAL Go2 over Wi-Fi (WebRTC). The Wi-Fi twin of cable_sport.py.
+
+THIS MAKES THE ROBOT MOVE. Clear 2 m around it and keep the remote in hand
+(remote emergency stop: hold L2 then press B = damping).
+
+    .venv/bin/python robot/wifi_sport.py ap standup          # Mac on the dog's own Wi-Fi
+    .venv/bin/python robot/wifi_sport.py ap balance
+    .venv/bin/python robot/wifi_sport.py ap move 0.2 0 0 2   # walk: vx vy vyaw seconds
+    .venv/bin/python robot/wifi_sport.py ap stop
+    .venv/bin/python robot/wifi_sport.py ap standdown
+    .venv/bin/python robot/wifi_sport.py ap damp             # motors soft: lie the dog down first
+    .venv/bin/python robot/wifi_sport.py 192.168.1.23 stop   # dog and Mac on the same router
+Add --dry-run to only print what would be sent. Add --yes to skip the 'Press Enter' question.
+
+The command ids are the same as the cable SDK (and the same in the newer MCF firmware mode):
+Damp 1001, BalanceStand 1002, StopMove 1003, StandUp 1004, StandDown 1005, RecoveryStand 1006, Move 1008.
+move limits (clamped here): |vx| <= 0.3 m/s, |vy| <= 0.2 m/s, |vyaw| <= 0.5 rad/s, seconds <= 3.
+"""
+import asyncio
+import json
+import random
+import sys
+import time
+
+from wifi_common import STOP, connect, disconnect, watch_for_stop
+
+SPORT_TOPIC = "rt/api/sport/request"
+SWITCHER_TOPIC = "rt/api/motion_switcher/request"
+LIMITS = {"vx": 0.3, "vy": 0.2, "vyaw": 0.5, "seconds": 3.0}
+MOVE_PERIOD = 0.05  # re-send the Move command every 0.05 s (20 times per second)
+
+# action -> (name, api id, what it does, asks for Enter first?)
+ACTIONS = {
+    "standup":   ("StandUp",       1004, "stand up and lock the joints", True),
+    "balance":   ("BalanceStand",  1002, "switch to balance stand (needed before walking)", True),
+    "recovery":  ("RecoveryStand", 1006, "recover to standing (e.g. after a fall)", True),
+    "stop":      ("StopMove",      1003, "stop moving, keep the current stance", False),
+    "standdown": ("StandDown",     1005, "lie down on the floor", False),
+    "damp":      ("Damp",          1001, "damping: all motors go soft (robot sinks if standing)", False),
+    "move":      ("Move",          1008, "walk with a velocity, then StopMove", True),
+}
+SAFE_TO_REPEAT = ("stop", "damp", "standdown")
+
+
+def usage():
+    print(__doc__)
+    sys.exit(1)
+
+
+def clamp(name, value):
+    lim = LIMITS[name]
+    clamped = max(-lim, min(lim, value))
+    if clamped != value:
+        print(f"  note: {name} = {value} clamped to {clamped}")
+    return clamped
+
+
+def parse_args(argv):
+    dry_run, yes = "--dry-run" in argv, "--yes" in argv
+    args = [a for a in argv if a not in ("--dry-run", "--yes")]
+    if len(args) < 2 or args[1] not in ACTIONS:
+        usage()
+    target, action, move = args[0], args[1], None
+    if action == "move":
+        if len(args) != 6:
+            print("move needs 4 numbers: vx vy vyaw seconds   e.g.  move 0.2 0 0 2")
+            sys.exit(1)
+        vx, vy, vyaw, secs = (float(x) for x in args[2:6])
+        vx, vy, vyaw = clamp("vx", vx), clamp("vy", vy), clamp("vyaw", vyaw)
+        if not 0.0 <= secs <= LIMITS["seconds"]:
+            print(f"  note: seconds = {secs} clamped to 0..{LIMITS['seconds']}")
+            secs = min(max(secs, 0.0), LIMITS["seconds"])
+        move = (vx, vy, vyaw, secs)
+    elif len(args) != 2:
+        print(f"'{action}' takes no extra numbers")
+        sys.exit(1)
+    return target, action, move, dry_run, yes
+
+
+async def request(conn, topic, api_id, parameter=None, timeout=5.0):
+    """A command that waits for the dog's answer. Returns its status code (0 = OK, -1 = no answer)."""
+    payload = {"api_id": api_id}
+    if parameter is not None:
+        payload["parameter"] = parameter
+    try:
+        answer = await asyncio.wait_for(conn.datachannel.pub_sub.publish_request_new(topic, payload), timeout)
+    except asyncio.TimeoutError:
+        return -1
+    return answer.get("data", {}).get("header", {}).get("status", {}).get("code", -1)
+
+
+def send_move(conn, vx, vy, vyaw):
+    """Move gets no answer from the dog (same as the cable SDK's Move): it is sent and not waited for."""
+    conn.datachannel.pub_sub.publish_without_callback(SPORT_TOPIC, {
+        "header": {"identity": {"id": int(time.time() * 1000) % 2147483648 + random.randint(0, 1000),
+                                "api_id": 1008},
+                   "policy": {"priority": 0, "noreply": True}},
+        "parameter": json.dumps({"x": vx, "y": vy, "z": vyaw}),
+        "binary": [],
+    })
+
+
+async def check_mode(conn):
+    """Read-only: which controller is active? An empty name means sport mode was released (low-level control),
+    and then sport commands do nothing. No answer at all is reported and ignored (newer firmware may not reply)."""
+    try:
+        answer = await asyncio.wait_for(
+            conn.datachannel.pub_sub.publish_request_new(SWITCHER_TOPIC, {"api_id": 1001}), 3.0)
+        name = json.loads(answer["data"]["data"]).get("name", "")
+    except Exception:
+        print("  motion switcher: no answer (continuing)")
+        return True
+    print(f"  motion switcher mode: {name!r}")
+    if not name:
+        print("  sport mode is RELEASED (low-level mode), so sport commands will not work.")
+        print("  Ask the instructor, or reboot the robot to get sport mode back.")
+        return False
+    return True
+
+
+async def main():
+    target, action, move, dry_run, yes = parse_args(sys.argv[1:])
+    method, api_id, what, confirm = ACTIONS[action]
+    print(f"Wi-Fi target {target}")
+    print(f"about to send: {method} (API {api_id}) = {what}")
+    if move:
+        vx, vy, vyaw, secs = move
+        print(f"  Move(vx={vx}, vy={vy}, vyaw={vyaw}) every {MOVE_PERIOD} s for {secs} s, then StopMove")
+    if dry_run:
+        print("dry run: nothing sent")
+        return
+    stop_event = asyncio.Event()
+    watch_for_stop(stop_event)
+    conn = await connect(target)
+    try:
+        if action not in ("stop", "damp") and not await check_mode(conn):
+            sys.exit(3)
+        if confirm and not yes:
+            await asyncio.to_thread(input, "Press Enter to send (Ctrl+C to cancel) ... ")
+        if STOP["requested"] and action not in SAFE_TO_REPEAT:
+            print(f"STOP was pressed before {method} went out: nothing sent")
+            if action != "move":
+                return
+        if action != "move":
+            code = await request(conn, SPORT_TOPIC, api_id)
+            if code != 0 and action in SAFE_TO_REPEAT:
+                code = await request(conn, SPORT_TOPIC, api_id)  # safe to repeat: try once more
+            print(f"{method} returned {'0 (OK)' if code == 0 else '-1 (no answer)' if code == -1 else code}")
+            return
+        n_sent, t_end = 0, None
+        try:
+            while not STOP["requested"] and (t_end is None or time.time() < t_end):
+                send_move(conn, vx, vy, vyaw)
+                if t_end is None:
+                    t_end = time.time() + secs  # the clock starts when the first Move has gone out
+                n_sent += 1
+                try:  # wait one period, but wake at once on STOP
+                    await asyncio.wait_for(stop_event.wait(), MOVE_PERIOD)
+                except asyncio.TimeoutError:
+                    pass
+            if STOP["requested"]:
+                print("STOP: stopping")
+        finally:
+            code = await request(conn, SPORT_TOPIC, 1003)
+            if code != 0:
+                code = await request(conn, SPORT_TOPIC, 1003)
+            print(f"Move sent {n_sent} times")
+            print(f"StopMove returned {'0 (OK)' if code == 0 else '-1 (no answer)' if code == -1 else code}")
+    finally:
+        await disconnect(conn)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
