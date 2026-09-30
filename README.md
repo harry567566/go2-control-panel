@@ -20,16 +20,117 @@ the cable. Not sure which one you have? Ask your instructor.
 Tested on a real Go2 EDU in the lab, over both cable and Wi-Fi, from an Apple Silicon Mac (macOS 15), in
 September 2026.
 
+## How the computer talks to the dog (any computer)
+
+The panel is a Mac app, but connecting to the dog works the same way on Windows, Linux or a Mac. This is everything
+the panel does underneath.
+
+### By cable: the official Unitree SDK over DDS (Go2 EDU)
+
+| | |
+|---|---|
+| The dog's computer | `192.168.123.161` |
+| Your computer | a fixed address on the same network, e.g. `192.168.123.222`, subnet mask `255.255.255.0` (prefix 24), no gateway |
+| Protocol | DDS ([Cyclone DDS](https://github.com/eclipse-cyclonedds/cyclonedds-python) 0.10.2), domain `0`. The two sides find each other by UDP multicast on the cable, so no address appears in the code, only the network card. |
+| Library | [unitree_sdk2_python](https://github.com/unitreerobotics/unitree_sdk2_python) (`unitree_sdk2py`), Python 3.10 |
+| Robot state | topics `rt/lowstate` (12 joints, IMU, foot forces, battery) and `rt/sportmodestate` (mode, body height, velocity, position), hundreds of messages a second |
+| Commands | a request on `rt/api/sport/request`, the answer on `rt/api/sport/response` (numbers below) |
+| Camera | `VideoClient().GetImageSample()`: service `videohub`, API 1001, one JPEG per call |
+
+Give your computer the fixed address on the cable's network card:
+
+- **Windows:** Settings > Network & internet > Ethernet > IP assignment > Edit > Manual, IPv4 on:
+  IP address `192.168.123.222`, subnet mask `255.255.255.0` (or prefix length `24`), gateway empty.
+- **Linux:** `sudo ip addr add 192.168.123.222/24 dev eth0` (your card's name: `ip -br link`).
+- **Mac:** button 1-1 in the panel does it; by hand: System Settings > Network > (the adapter) > Details > TCP/IP >
+  Configure IPv4: Manually.
+
+Then `ping 192.168.123.161` must answer. Minimal Python (with the environment from the install below):
+
+```python
+import time
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+
+# domain 0 + the network card on 192.168.123.x: Mac e.g. "en7", Linux e.g. "eth0",
+# Windows the adapter's name as Windows shows it, e.g. "Ethernet 2" (PowerShell: Get-NetAdapter)
+ChannelFactoryInitialize(0, "en7")
+
+latest = {}
+sub = ChannelSubscriber("rt/lowstate", LowState_)
+sub.Init(lambda msg: latest.update(msg=msg), 10)
+time.sleep(1)
+msg = latest["msg"]
+print(f"battery {msg.power_v:.1f} V, front-right leg angles {[round(m.q, 2) for m in msg.motor_state[:3]]}")
+
+sport = SportClient()
+sport.SetTimeout(5.0)
+sport.Init()
+print("StandUp returned", sport.StandUp())   # 0 = OK. The dog stands up: only with the instructor!
+```
+
+### By Wi-Fi: WebRTC, like the phone app (any Go2)
+
+| | |
+|---|---|
+| The dog's own hotspot | the dog is `192.168.12.1`; your computer gets a `192.168.12.x` address from it |
+| Dog on a router (STA mode) | use the dog's address on that router instead |
+| Signaling | HTTP on the dog's port `9991` (newer firmware) or `8081` (older) |
+| Protocol | WebRTC: a data channel carries the same topics and command numbers as the cable; the camera comes as a video stream |
+| Library | [unitree_webrtc_connect](https://github.com/legion1581/unitree_webrtc_connect) 2.2.0, Python 3.8 or newer, Windows / Linux / Mac |
+| Key | firmware 1.1.15 or newer: the dog's AES-128 key (32 hex characters), see [Wi-Fi key](#wi-fi-key-firmware-1115-or-newer) |
+| Robot state | topics `rt/lf/lowstate` and `rt/lf/sportmodestate` (lower-rate copies) |
+| Clients | one at a time: close the Unitree phone app first |
+
+Minimal Python:
+
+```python
+import asyncio
+from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection, WebRTCConnectionMethod
+
+async def main():
+    conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalAP)   # add aes_128_key="..." on firmware 1.1.15+
+    # dog on a router: UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="192.168.1.23")
+    await conn.connect()
+    conn.datachannel.pub_sub.subscribe("rt/lf/lowstate", lambda m: print("battery", m["data"]["power_v"], "V"))
+    await asyncio.sleep(2)
+    answer = await conn.datachannel.pub_sub.publish_request_new("rt/api/sport/request", {"api_id": 1004})
+    print("StandUp returned", answer["data"]["header"]["status"]["code"])   # 0 = OK. The dog stands up!
+    await conn.disconnect()   # always hang up: the dog takes one Wi-Fi client at a time
+
+asyncio.run(main())
+```
+
+### The commands (the same numbers on both connections)
+
+| Command | Number (`api_id`) | Parameter | The dog answers? |
+|---|---|---|---|
+| Damp (all motors soft) | 1001 | none | yes |
+| BalanceStand | 1002 | none | yes |
+| StopMove | 1003 | none | yes |
+| StandUp | 1004 | none | yes |
+| StandDown (lie down) | 1005 | none | yes |
+| RecoveryStand (get up after a fall) | 1006 | none | yes |
+| Move | 1008 | `{"x": forward m/s, "y": left m/s, "z": turn left rad/s}` | no: re-send it about 20 times a second while walking, then StopMove |
+
+With the SDK these are `SportClient()` methods: `Damp()`, `BalanceStand()`, `StopMove()`, `StandUp()`, `StandDown()`,
+`RecoveryStand()`, `Move(vx, vy, vyaw)`. Answer code `0` means OK. On the cable, `3102` means the request could not
+be sent (the dog's sport service was not found) and `3104` means no answer in time. Before moving, the scripts ask
+`rt/api/motion_switcher/request` (API 1001, CheckMode): an empty mode name means the dog's own walking controller is
+off and sport commands do nothing. These commands only say what to do; the dog's own controller moves its 12 motors.
+Keep speeds small: the panel allows at most 0.3 m/s and 0.5 rad/s, for 3 s.
+
 ## What you need
 
-- A Mac (Apple Silicon or Intel).
+- For the panel: a Mac (Apple Silicon or Intel). Windows and Linux: see [below](#windows-and-linux-command-line-not-tested-yet).
 - **Python 3.10.** Not newer: the cable SDK's DDS library (cyclonedds 0.10.2) only has ready-made packages up to 3.10.
   Other Python versions on your Mac can stay; 3.10 installs next to them.
 - For the cable: a Go2 **EDU**, a **USB-C to Ethernet adapter** and an Ethernet cable, and the password of an
   administrator of your Mac (on your own Mac: your login password).
 - For Wi-Fi: any Go2, and the dog's Wi-Fi password. Newer firmware also needs a key, see [Wi-Fi key](#wi-fi-key-firmware-1115-or-newer).
 
-## Install (once, a few minutes, needs internet)
+## Install on a Mac (once, a few minutes, needs internet)
 
 All commands go into **Terminal**: press Cmd+Space, type `Terminal`, press Return. Paste one command at a time and
 press Return after each.
@@ -66,7 +167,7 @@ Downloaded the ZIP instead of using git? The folder is then called `go2-control-
 `cd go2-control-panel-main`, and start the panel with `bash start.command` (macOS may block double-clicking files
 that came from a download).
 
-## Connect by cable (Go2 EDU)
+## In the panel: connect by cable (Go2 EDU)
 
 1. Plug the USB-C to Ethernet adapter into the Mac, and the cable into the dog's Ethernet port (ask your instructor
    where it is on your dog). Turn the dog on and wait about 1 minute.
@@ -81,7 +182,7 @@ that came from a download).
 The adapter keeps the address 192.168.123.222 afterwards. To use it on a normal wired network again: System Settings >
 Network > (the adapter) > Details > TCP/IP > Configure IPv4: Using DHCP.
 
-## Connect by Wi-Fi (any Go2)
+## In the panel: connect by Wi-Fi (any Go2)
 
 1. **Close the Unitree app on your phone.** The dog accepts only one Wi-Fi client at a time.
 2. Click the Wi-Fi icon at the top right of the Mac screen and join the dog's Wi-Fi (its name usually starts
@@ -120,6 +221,33 @@ Both ask for the account password; nothing appears while you type it, press Retu
 Check: `cat robot/.go2_aes_key` shows 32 letters and digits; if not, run `rm robot/.go2_aes_key` and try again.
 The key stays in `robot/.go2_aes_key` on your Mac and is never uploaded. Older firmware does not need it: **1-1**
 tells you whether a key was found.
+
+## Windows and Linux (command line, not tested yet)
+
+The panel's window and its `.sh` helpers are Mac-only, but the scripts in `robot/` are plain Python and use the same
+connection as above. First give the computer its address (cable) or join the dog's Wi-Fi, as described in
+[How the computer talks to the dog](#how-the-computer-talks-to-the-dog-any-computer).
+
+**Windows** (Python 3.10: the "Windows installer (64-bit)" on the
+[3.10.11 page](https://www.python.org/downloads/release/python-31011/)). In PowerShell, inside the downloaded folder:
+
+```
+py -3.10 -m venv .venv
+.venv\Scripts\pip install cyclonedds==0.10.2 numpy
+.venv\Scripts\pip install --no-deps https://github.com/unitreerobotics/unitree_sdk2_python/archive/814556d15970dd2ecf1c9984e845ca02ab07e206.zip
+.venv\Scripts\pip install "aiortc>=1.9.0" pycryptodome requests curl_cffi wasmtime lz4 packaging sounddevice pydub pillow
+.venv\Scripts\pip install --no-deps unitree_webrtc_connect==2.2.0
+
+.venv\Scripts\python robot\cable_state.py "Ethernet 2" 10     # cable: the adapter's name from Get-NetAdapter
+.venv\Scripts\python robot\wifi_state.py ap 10                # Wi-Fi: on the dog's hotspot
+.venv\Scripts\python robot\wifi_sport.py ap standup --yes     # moves the dog
+```
+
+If the cable SDK fails to start on Windows, create the folder `C:\tmp`: the SDK writes a log file to `/tmp/cdds.LOG`.
+
+**Linux** (Ubuntu 22.04 comes with Python 3.10): `sudo apt install python3.10-venv python3-tk`, then `bash setup.sh`,
+then the same commands as on the Mac with your card's name from `ip -br link`, for example
+`.venv/bin/python robot/cable_state.py eth0 10`.
 
 ## The buttons
 
@@ -190,19 +318,14 @@ bash robot/wifi_check.sh                                    # 1-1 on Wi-Fi
 .venv/bin/python robot/wifi_sport.py ap move 0.2 0 0 2
 ```
 
-- **Cable (DDS).** The Mac and the dog find each other by multicast on the wired network (DDS domain 0). The dog
-  publishes its state on the topics `rt/lowstate` and `rt/sportmodestate`, hundreds of messages a second. A command
-  is a small request on `rt/api/sport/request` with an API number and JSON parameters, for example Move is
-  `1008 {"x": 0.2, "y": 0, "z": 0}`, and the dog answers on `rt/api/sport/response`.
-- **Wi-Fi (WebRTC).** The same API numbers and topics travel over a WebRTC data channel, and the camera comes as a
-  video stream, like in the phone app.
-- **Who moves the legs.** Only high-level commands are sent (StandUp 1004, BalanceStand 1002, Move 1008,
-  StopMove 1003, StandDown 1005, Damp 1001). The dog's own controller decides how to move its 12 motors.
+- The addresses, topics and command numbers are in
+  [How the computer talks to the dog](#how-the-computer-talks-to-the-dog-any-computer). Only high-level commands are
+  sent; the dog's own controller decides how to move its 12 motors.
 - A walk re-sends Move 20 times a second and always ends with StopMove. STOP, the panel's time limits and closing the
   window all end a running walk the same way, and a command that has not gone out yet is not sent after STOP.
 
-Only macOS has been tested. The `robot/*.py` scripts are plain Python and may also work on Linux; the `.sh` helpers
-and the network setup in 1-1 are Mac-only.
+The panel has been tested on macOS only; for Windows and Linux see
+[above](#windows-and-linux-command-line-not-tested-yet).
 
 ## Credits
 

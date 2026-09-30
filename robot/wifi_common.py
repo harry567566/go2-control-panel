@@ -42,7 +42,9 @@ def aes_key():
 
 
 def watch_for_stop(event):
-    """SIGTERM or Ctrl+C: remember it and wake anything waiting on `event` (inside the running loop)."""
+    """SIGTERM or Ctrl+C: remember it and wake anything waiting on `event` (inside the running loop).
+    Windows has no loop signal handlers; there Ctrl+C simply ends the script, and a walk still sends StopMove
+    on its way out."""
     loop = asyncio.get_running_loop()
 
     def stop():
@@ -50,7 +52,10 @@ def watch_for_stop(event):
         event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop)
+        try:
+            loop.add_signal_handler(sig, stop)
+        except (NotImplementedError, RuntimeError):
+            pass
 
 
 async def connect(target, timeout=25.0):
